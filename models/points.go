@@ -5,11 +5,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"hash/fnv"
 	"math"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/influxdata/influxdb/pkg/escape"
@@ -75,6 +77,33 @@ type Point interface {
 	// is a timestamp associated with the point, then it will be rounded to the
 	// given duration
 	RoundedString(d time.Duration) string
+
+	// FieldIterator retuns a FieldIterator that can be used to traverse the
+	// fields of a point without constructing the in-memory map
+	FieldIterator() FieldIterator
+}
+
+type FieldType int
+
+const (
+	Integer FieldType = iota
+	Float
+	Boolean
+	String
+	Empty
+)
+
+type FieldIterator interface {
+	Next() bool
+	FieldKey() []byte
+	Type() FieldType
+	StringValue() string
+	IntegerValue() int64
+	BooleanValue() bool
+	FloatValue() float64
+
+	Delete() error
+	Reset()
 }
 
 // Points represents a sortable list of points by timestamp.
@@ -107,6 +136,8 @@ type point struct {
 
 	// cached version of parsed name from key
 	cachedName string
+
+	it fieldIterator
 }
 
 const (
@@ -156,7 +187,7 @@ func ParseKey(buf []byte) (string, Tags, error) {
 // ParsePointsWithPrecision is similar to ParsePoints, but allows the
 // caller to provide a precision for time.
 func ParsePointsWithPrecision(buf []byte, defaultTime time.Time, precision string) ([]Point, error) {
-	points := []Point{}
+	points := make([]Point, 0, bytes.Count(buf, []byte("\n"))) // rough hint
 	var (
 		pos    int
 		block  []byte
@@ -187,7 +218,7 @@ func ParsePointsWithPrecision(buf []byte, defaultTime time.Time, precision strin
 			block = block[:len(block)-1]
 		}
 
-		pt, err := parsePoint(block[start:len(block)], defaultTime, precision)
+		pt, err := parsePoint(block[start:], defaultTime, precision)
 		if err != nil {
 			failed = append(failed, fmt.Sprintf("unable to parse '%s': %v", string(block[start:len(block)]), err))
 		} else {
@@ -245,7 +276,7 @@ func parsePoint(buf []byte, defaultTime time.Time, precision string) (Point, err
 		pt.time = defaultTime
 		pt.SetPrecision(precision)
 	} else {
-		ts, err := strconv.ParseInt(string(ts), 10, 64)
+		ts, err := parseInt64Bytes(ts)
 		if err != nil {
 			return nil, err
 		}
@@ -991,11 +1022,7 @@ func scanTagValue(buf []byte, i int) (int, []byte) {
 func scanFieldValue(buf []byte, i int) (int, []byte) {
 	start := i
 	quoted := false
-	for {
-		if i >= len(buf) {
-			break
-		}
-
+	for i < len(buf) {
 		// Only escape char for a field value is a double-quote
 		if buf[i] == '\\' && i+1 < len(buf) && buf[i+1] == '"' {
 			i += 2
@@ -1375,10 +1402,24 @@ func (p *point) unmarshalBinary() Fields {
 	return newFieldsFromBinary(p.fields)
 }
 
+var hashPool = sync.Pool{
+	New: func() interface{} { return fnv.New64a() },
+}
+
+func getHash() hash.Hash64 {
+	return hashPool.Get().(hash.Hash64)
+}
+
+func freeHash(h hash.Hash64) {
+	h.Reset()
+	hashPool.Put(h)
+}
+
 func (p *point) HashID() uint64 {
-	h := fnv.New64a()
+	h := getHash()
 	h.Write(p.key)
 	sum := h.Sum64()
+	freeHash(h)
 	return sum
 }
 
@@ -1589,6 +1630,208 @@ func newFieldsFromBinary(buf []byte) Fields {
 		i++
 	}
 	return fields
+}
+
+var errInvalidBoolean = errors.New("invalid boolean value")
+
+var (
+	rue          = []byte("rue")
+	capitalTrue  = []byte("TRUE")
+	alse         = []byte("alse")
+	capitalFalse = []byte("FALSE")
+)
+
+func parseBoolBytes(b []byte) (bool, error) {
+	if len(b) == 0 {
+		return false, errInvalidBoolean
+	}
+	switch b[0] {
+	case 't', 'T':
+		if len(b) == 0 {
+			return true, nil
+		}
+		if bytes.Equal(b[1:], rue) || bytes.Equal(b, capitalTrue) {
+			return true, nil
+		}
+	case 'f', 'F':
+		if len(b) == 0 {
+			return false, nil
+		}
+		if bytes.Equal(b[1:], alse) || bytes.Equal(b, capitalFalse) {
+			return false, nil
+		}
+	}
+
+	return false, errInvalidBoolean
+}
+
+func (p *point) FieldIterator() FieldIterator {
+	p.Reset()
+	return p
+}
+
+type fieldIterator struct {
+	start, end  int
+	key, keybuf []byte
+	valueBuf    []byte
+	err         error
+	fieldType   FieldType
+}
+
+func (p *point) Next() bool {
+	p.it.start = p.it.end
+	if p.it.err != nil || p.it.start >= len(p.fields) {
+		return false
+	}
+
+	p.it.end, p.it.key = scanTo(p.fields, p.it.start, '=')
+	if escape.IsEscaped(p.it.key) {
+		p.it.keybuf = escape.AppendUnescaped(p.it.keybuf[:0], p.it.key)
+		p.it.key = p.it.keybuf
+	}
+
+	p.it.end, p.it.valueBuf = scanFieldValue(p.fields, p.it.end+1)
+	p.it.end++
+
+	if len(p.it.valueBuf) == 0 {
+		p.it.fieldType = Empty
+		return true
+	}
+
+	c := p.it.valueBuf[0]
+
+	if c == '"' {
+		p.it.fieldType = String
+		return true
+	}
+
+	if strings.IndexByte(`0123456789-.nNiI`, c) >= 0 {
+		if p.it.valueBuf[len(p.it.valueBuf)-1] == 'i' {
+			p.it.fieldType = Integer
+			p.it.valueBuf = p.it.valueBuf[:len(p.it.valueBuf)-1]
+		} else {
+			p.it.fieldType = Float
+		}
+		return true
+	}
+
+	// to keep the same behavior that currently exists, default to boolean
+	p.it.fieldType = Boolean
+	return true
+}
+
+func (p *point) FieldKey() []byte {
+	return p.it.key
+}
+
+func (p *point) Type() FieldType {
+	return p.it.fieldType
+}
+
+func (p *point) StringValue() string {
+	return unescapeStringField(string(p.it.valueBuf[1 : len(p.it.valueBuf)-1]))
+}
+
+func (p *point) IntegerValue() int64 {
+	return mustInt64Bytes(p.it.valueBuf)
+}
+
+func (p *point) BooleanValue() bool {
+	b, err := parseBoolBytes(p.it.valueBuf)
+	if err != nil {
+		panic(fmt.Sprintf("unable to parse bool value %q: %v", p.it.valueBuf, err))
+	}
+	return b
+}
+
+func (p *point) FloatValue() float64 {
+	f, err := strconv.ParseFloat(string(p.it.valueBuf), 64)
+	if err != nil {
+		panic(fmt.Sprintf("unable to parse floating point value %q: %v", p.it.valueBuf, err))
+	}
+	return f
+}
+
+func (p *point) Delete() error {
+	switch {
+	case p.it.end == p.it.start:
+	case p.it.end >= len(p.fields):
+		p.fields = p.fields[:p.it.start]
+	case p.it.start == 0:
+		p.fields = p.fields[p.it.end+1:]
+	default:
+		p.fields = append(p.fields[:p.it.start], p.fields[p.it.end+1:]...)
+	}
+
+	p.it.end = p.it.start
+	p.it.key = nil
+	p.it.fieldType = Empty
+
+	return nil
+}
+
+func (p *point) Reset() {
+	p.it.fieldType = Empty
+	p.it.key = nil
+	p.it.keybuf = p.it.keybuf[:0]
+	p.it.valueBuf = p.it.valueBuf[:0]
+	p.it.start = 0
+	p.it.end = 0
+	p.it.err = nil
+}
+
+const (
+	limitInt63 uint64 = 1 << 63
+)
+
+func mustInt64Bytes(b []byte) int64 {
+	i, err := parseInt64Bytes(b)
+	if err != nil {
+		panic(err)
+	}
+	return i
+}
+
+// parseInt64Bytes is a trimmed-down version of strconv.ParseInt that works on a byte slice
+func parseInt64Bytes(b []byte) (int64, error) {
+	i := 0
+	negative := false
+	if len(b) > 0 && b[0] == '-' {
+		negative = true
+		i++
+	}
+
+	if len(b) == i {
+		return 0, fmt.Errorf("invalid integer literal %q", b)
+	}
+
+	var cur uint64
+	for ; i < len(b); i++ {
+		if b[i] < '0' || b[i] > '9' {
+			return 0, fmt.Errorf("invalid integer literal %q", b)
+		}
+
+		next := cur*10 + uint64(b[i]-'0')
+		if next < cur {
+			return 0, fmt.Errorf("integer %q overflows int64", b)
+		}
+		cur = next
+	}
+
+	limit := limitInt63
+	if !negative {
+		limit--
+	}
+
+	if cur > limit {
+		return 0, fmt.Errorf("integer %q overflows int64", b)
+	}
+
+	n := int64(cur)
+	if negative {
+		n = -n
+	}
+	return n, nil
 }
 
 // MarshalBinary encodes all the fields to their proper type and returns the binary
